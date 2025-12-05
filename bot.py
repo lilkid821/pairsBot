@@ -7,11 +7,11 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters
 )
 from telegram.constants import ParseMode
-import asyncio
 from functools import wraps
+from flask import Flask, jsonify
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +19,22 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Flask app for Render health checks
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return jsonify({
+        'status': 'online',
+        'bot': 'Forex Pairs Bot',
+        'mode': 'polling',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy'}), 200
 
 # Forex pairs data with real-time categories
 FOREX_PAIRS = {
@@ -215,8 +231,6 @@ async def random_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot statistics"""
-    total_pairs = sum(len(pairs) for pairs in FOREX_PAIRS.items())
-    
     stats_message = (
         "📊 *Bot Statistics*\n\n"
         f"Major Pairs: {len(FOREX_PAIRS['Major'])}\n"
@@ -224,7 +238,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Exotic Pairs: {len(FOREX_PAIRS['Exotic'])}\n"
         f"Total Pairs: {sum(len(pairs) for pairs in FOREX_PAIRS.values())}\n\n"
         f"🕐 Server Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-        f"✅ Bot Status: Online"
+        f"✅ Bot Status: Online (Polling Mode)\n"
+        f"🔄 Mode: Long Polling"
     )
     
     await update.message.reply_text(stats_message, parse_mode=ParseMode.MARKDOWN)
@@ -319,6 +334,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Please try again later."
         )
 
+def run_flask():
+    """Run Flask app in a separate thread"""
+    port = int(os.getenv('PORT', 10000))
+    logger.info(f"Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
 def main():
     """Main function to run the bot"""
     # Get bot token from environment variable
@@ -326,13 +347,21 @@ def main():
     
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN not found in environment variables!")
+        logger.error("Please set TELEGRAM_BOT_TOKEN in your Render environment variables")
         return
+    
+    logger.info("Bot token loaded successfully")
     
     # Optional: Load authorized users from environment
     auth_users = os.getenv('AUTHORIZED_USERS', '')
     if auth_users:
         AUTHORIZED_USERS.update(int(user_id) for user_id in auth_users.split(',') if user_id.strip())
         logger.info(f"Loaded {len(AUTHORIZED_USERS)} authorized users")
+    
+    # Start Flask server in background thread for Render health checks
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask health check server started")
     
     # Create application
     application = Application.builder().token(token).build()
@@ -351,28 +380,16 @@ def main():
     # Add error handler
     application.add_error_handler(error_handler)
     
-    # Get port from environment (Render requirement)
-    port = int(os.getenv('PORT', 8443))
+    # Start bot with long polling (works on Render!)
+    logger.info("Starting bot in polling mode...")
+    logger.info("Bot is now running and waiting for messages!")
     
-    # Start webhook for Render (or polling for local development)
-    if os.getenv('RENDER'):
-        # Production mode on Render
-        webhook_url = os.getenv('WEBHOOK_URL')
-        if not webhook_url:
-            logger.error("WEBHOOK_URL not set for production!")
-            return
-        
-        logger.info(f"Starting webhook on port {port}")
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=token,
-            webhook_url=f"{webhook_url}/{token}"
-        )
-    else:
-        # Development mode - use polling
-        logger.info("Starting polling mode (development)")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=30
+    )
 
 if __name__ == '__main__':
     main()
